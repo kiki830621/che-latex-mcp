@@ -5,6 +5,75 @@ import UniformTypeIdentifiers
 
 // MARK: - Tool Definitions
 
+let compileLatexTool = Tool(
+    name: "compile_latex",
+    description: "編譯 LaTeX 專案（使用 latexmk 或 xelatex）",
+    inputSchema: [
+        "type": "object",
+        "properties": [
+            "project_path": [
+                "type": "string",
+                "description": "LaTeX 專案目錄路徑"
+            ],
+            "main_file": [
+                "type": "string",
+                "description": "主檔案名（不含副檔名），預設為 main"
+            ],
+            "engine": [
+                "type": "string",
+                "description": "編譯引擎：xelatex（預設）、pdflatex、lualatex"
+            ],
+            "full_compile": [
+                "type": "boolean",
+                "description": "是否完整編譯（多次執行以解決交叉引用），預設為 true"
+            ]
+        ],
+        "required": ["project_path"]
+    ]
+)
+
+let checkErrorsTool = Tool(
+    name: "check_errors",
+    description: "檢查 LaTeX log 檔案中的錯誤和警告",
+    inputSchema: [
+        "type": "object",
+        "properties": [
+            "project_path": [
+                "type": "string",
+                "description": "LaTeX 專案目錄路徑"
+            ],
+            "main_file": [
+                "type": "string",
+                "description": "主檔案名（不含副檔名），預設為 main"
+            ],
+            "include_warnings": [
+                "type": "boolean",
+                "description": "是否包含警告（預設只顯示錯誤）"
+            ]
+        ],
+        "required": ["project_path"]
+    ]
+)
+
+let getDocumentInfoTool = Tool(
+    name: "get_document_info",
+    description: "取得 LaTeX 文件的基本資訊（頁數、章節數、使用的套件等）",
+    inputSchema: [
+        "type": "object",
+        "properties": [
+            "project_path": [
+                "type": "string",
+                "description": "LaTeX 專案目錄路徑"
+            ],
+            "main_file": [
+                "type": "string",
+                "description": "主檔案名（不含副檔名），預設為 main"
+            ]
+        ],
+        "required": ["project_path"]
+    ]
+)
+
 let analyzePagesTool = Tool(
     name: "analyze_pages",
     description: "分析 LaTeX 專案的頁面分布，從 .toc 檔案讀取章節對應頁碼",
@@ -86,6 +155,279 @@ let previewPageTool = Tool(
 )
 
 // MARK: - Tool Implementations
+
+func compileLatex(projectPath: String, mainFile: String, engine: String, fullCompile: Bool) -> String {
+    let projectURL = URL(fileURLWithPath: projectPath)
+    let texFile = projectURL.appendingPathComponent("\(mainFile).tex")
+
+    guard FileManager.default.fileExists(atPath: texFile.path) else {
+        return "找不到 \(texFile.path)"
+    }
+
+    var result = ["# LaTeX 編譯結果\n"]
+
+    let process = Process()
+    let pipe = Pipe()
+
+    process.currentDirectoryURL = projectURL
+    process.standardOutput = pipe
+    process.standardError = pipe
+
+    if fullCompile {
+        // 使用 latexmk 進行完整編譯
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["latexmk", "-\(engine)", "-interaction=nonstopmode", "-file-line-error", "\(mainFile).tex"]
+    } else {
+        // 單次編譯
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = [engine, "-interaction=nonstopmode", "-file-line-error", "\(mainFile).tex"]
+    }
+
+    do {
+        try process.run()
+        process.waitUntilExit()
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+
+        if process.terminationStatus == 0 {
+            result.append("✅ 編譯成功！")
+
+            // 檢查 PDF 是否產生
+            let pdfPath = projectURL.appendingPathComponent("\(mainFile).pdf")
+            if let pdfDoc = PDFDocument(url: pdfPath) {
+                result.append("- 產生 PDF：\(pdfPath.path)")
+                result.append("- 總頁數：\(pdfDoc.pageCount) 頁")
+            }
+        } else {
+            result.append("❌ 編譯失敗（exit code: \(process.terminationStatus)）")
+
+            // 擷取錯誤訊息
+            let errorLines = output.components(separatedBy: .newlines)
+                .filter { $0.contains("!") || $0.contains("Error") || $0.contains("error:") }
+                .prefix(20)
+
+            if !errorLines.isEmpty {
+                result.append("\n## 錯誤訊息")
+                result.append("```")
+                result.append(contentsOf: errorLines)
+                result.append("```")
+            }
+        }
+    } catch {
+        result.append("❌ 無法執行編譯命令：\(error.localizedDescription)")
+        result.append("\n請確認已安裝 TeX Live 或 MacTeX")
+    }
+
+    return result.joined(separator: "\n")
+}
+
+func checkErrors(projectPath: String, mainFile: String, includeWarnings: Bool) -> String {
+    let logPath = URL(fileURLWithPath: projectPath).appendingPathComponent("\(mainFile).log")
+
+    guard FileManager.default.fileExists(atPath: logPath.path) else {
+        return "找不到 \(logPath.path)，請先編譯 LaTeX"
+    }
+
+    guard let content = try? String(contentsOf: logPath, encoding: .utf8) else {
+        return "無法讀取 .log 檔案"
+    }
+
+    var result = ["# LaTeX 錯誤與警告檢查\n"]
+    var errors: [(file: String, line: Int?, message: String)] = []
+    var warnings: [(file: String, line: Int?, message: String)] = []
+
+    let lines = content.components(separatedBy: .newlines)
+    var currentFile = "\(mainFile).tex"
+    var i = 0
+
+    while i < lines.count {
+        let line = lines[i]
+
+        // 追蹤當前檔案
+        if let regex = try? NSRegularExpression(pattern: #"\(\.?/?([^()\s]+\.tex)"#, options: []) {
+            let range = NSRange(line.startIndex..., in: line)
+            if let match = regex.firstMatch(in: line, options: [], range: range),
+               let fileRange = Range(match.range(at: 1), in: line) {
+                currentFile = String(line[fileRange])
+            }
+        }
+
+        // 偵測錯誤（以 ! 開頭）
+        if line.hasPrefix("!") {
+            var errorMsg = line
+            // 收集後續的錯誤資訊
+            var j = i + 1
+            while j < lines.count && !lines[j].hasPrefix("!") && !lines[j].contains("l.") {
+                if !lines[j].isEmpty {
+                    errorMsg += " " + lines[j].trimmingCharacters(in: .whitespaces)
+                }
+                j += 1
+            }
+
+            // 嘗試取得行號
+            var lineNum: Int? = nil
+            if j < lines.count, let lMatch = lines[j].range(of: #"l\.(\d+)"#, options: .regularExpression) {
+                let numStr = lines[j][lMatch].dropFirst(2)
+                lineNum = Int(numStr)
+            }
+
+            errors.append((file: currentFile, line: lineNum, message: errorMsg))
+            i = j
+            continue
+        }
+
+        // 偵測警告
+        if includeWarnings {
+            if line.contains("Warning:") || line.contains("warning:") {
+                var warningMsg = line
+                // 收集多行警告
+                var j = i + 1
+                while j < lines.count && lines[j].hasPrefix(" ") && !lines[j].contains("Warning") {
+                    warningMsg += " " + lines[j].trimmingCharacters(in: .whitespaces)
+                    j += 1
+                }
+                warnings.append((file: currentFile, line: nil, message: warningMsg))
+                i = j
+                continue
+            }
+        }
+
+        i += 1
+    }
+
+    // 輸出結果
+    if errors.isEmpty && warnings.isEmpty {
+        result.append("✅ 沒有發現錯誤" + (includeWarnings ? "或警告" : ""))
+    } else {
+        if !errors.isEmpty {
+            result.append("## ❌ 錯誤（\(errors.count) 個）\n")
+            for (idx, error) in errors.enumerated() {
+                let lineInfo = error.line != nil ? ":\(error.line!)" : ""
+                result.append("\(idx + 1). **\(error.file)\(lineInfo)**")
+                result.append("   \(error.message)\n")
+            }
+        }
+
+        if !warnings.isEmpty {
+            result.append("## ⚠️ 警告（\(warnings.count) 個）\n")
+            for (idx, warning) in warnings.prefix(20).enumerated() {
+                result.append("\(idx + 1). \(warning.file): \(warning.message)")
+            }
+            if warnings.count > 20 {
+                result.append("\n... 還有 \(warnings.count - 20) 個警告")
+            }
+        }
+    }
+
+    return result.joined(separator: "\n")
+}
+
+func getDocumentInfo(projectPath: String, mainFile: String) -> String {
+    let projectURL = URL(fileURLWithPath: projectPath)
+    var result = ["# LaTeX 文件資訊\n"]
+
+    // 讀取主檔案
+    let texPath = projectURL.appendingPathComponent("\(mainFile).tex")
+    guard let texContent = try? String(contentsOf: texPath, encoding: .utf8) else {
+        return "找不到或無法讀取 \(texPath.path)"
+    }
+
+    // 分析 documentclass
+    if let regex = try? NSRegularExpression(pattern: #"\\documentclass(?:\[([^\]]*)\])?\{([^}]+)\}"#, options: []),
+       let match = regex.firstMatch(in: texContent, options: [], range: NSRange(texContent.startIndex..., in: texContent)) {
+        let classRange = Range(match.range(at: 2), in: texContent)!
+        let docClass = String(texContent[classRange])
+        result.append("## 文件類型")
+        result.append("- documentclass: `\(docClass)`")
+
+        if match.range(at: 1).location != NSNotFound,
+           let optRange = Range(match.range(at: 1), in: texContent) {
+            let options = String(texContent[optRange])
+            result.append("- 選項: `\(options)`")
+        }
+        result.append("")
+    }
+
+    // 分析使用的套件
+    var packages: [String] = []
+    if let regex = try? NSRegularExpression(pattern: #"\\usepackage(?:\[[^\]]*\])?\{([^}]+)\}"#, options: []) {
+        let matches = regex.matches(in: texContent, options: [], range: NSRange(texContent.startIndex..., in: texContent))
+        for match in matches {
+            if let pkgRange = Range(match.range(at: 1), in: texContent) {
+                let pkg = String(texContent[pkgRange])
+                // 可能有多個套件用逗號分隔
+                packages.append(contentsOf: pkg.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) })
+            }
+        }
+    }
+
+    if !packages.isEmpty {
+        result.append("## 使用的套件（\(packages.count) 個）")
+        result.append(packages.map { "- `\($0)`" }.joined(separator: "\n"))
+        result.append("")
+    }
+
+    // 讀取 PDF 資訊
+    let pdfPath = projectURL.appendingPathComponent("\(mainFile).pdf")
+    if let pdfDoc = PDFDocument(url: pdfPath) {
+        result.append("## PDF 資訊")
+        result.append("- 總頁數：\(pdfDoc.pageCount) 頁")
+
+        if let page = pdfDoc.page(at: 0) {
+            let bounds = page.bounds(for: .mediaBox)
+            result.append("- 頁面尺寸：\(Int(bounds.width)) × \(Int(bounds.height)) pt")
+        }
+        result.append("")
+    }
+
+    // 讀取 .toc 分析章節結構
+    let tocPath = projectURL.appendingPathComponent("\(mainFile).toc")
+    if let tocContent = try? String(contentsOf: tocPath, encoding: .utf8) {
+        var partCount = 0
+        var sectionCount = 0
+        var subsectionCount = 0
+
+        let pattern = #"\\contentsline\s*\{(part|section|subsection)\}"#
+        if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
+            let matches = regex.matches(in: tocContent, options: [], range: NSRange(tocContent.startIndex..., in: tocContent))
+            for match in matches {
+                if let levelRange = Range(match.range(at: 1), in: tocContent) {
+                    switch String(tocContent[levelRange]) {
+                    case "part": partCount += 1
+                    case "section": sectionCount += 1
+                    case "subsection": subsectionCount += 1
+                    default: break
+                    }
+                }
+            }
+        }
+
+        result.append("## 章節結構")
+        if partCount > 0 { result.append("- Part: \(partCount) 個") }
+        if sectionCount > 0 { result.append("- Section: \(sectionCount) 個") }
+        if subsectionCount > 0 { result.append("- Subsection: \(subsectionCount) 個") }
+        result.append("")
+    }
+
+    // 檢查 .log 中的編譯資訊
+    let logPath = projectURL.appendingPathComponent("\(mainFile).log")
+    if let logContent = try? String(contentsOf: logPath, encoding: .utf8) {
+        // 擷取 TeX 版本
+        if let versionMatch = logContent.range(of: #"This is [^,]+"#, options: .regularExpression) {
+            result.append("## 編譯資訊")
+            result.append("- 引擎：\(String(logContent[versionMatch]))")
+        }
+
+        // 檢查是否有警告
+        let warningCount = logContent.components(separatedBy: "Warning:").count - 1
+        if warningCount > 0 {
+            result.append("- 警告數：\(warningCount) 個")
+        }
+    }
+
+    return result.joined(separator: "\n")
+}
 
 func analyzePages(projectPath: String, mainFile: String) -> String {
     let tocPath = URL(fileURLWithPath: projectPath).appendingPathComponent("\(mainFile).toc")
@@ -319,13 +661,16 @@ struct LatexMCP {
     static func main() async throws {
         let server = Server(
             name: "che-latex-mcp",
-            version: "0.1.0",
+            version: "0.2.0",
             capabilities: .init(tools: .init(listChanged: false))
         )
 
         // 列出所有 tools
         await server.withMethodHandler(ListTools.self) { _ in
             return .init(tools: [
+                compileLatexTool,
+                checkErrorsTool,
+                getDocumentInfoTool,
                 analyzePagesTool,
                 getPageContentTool,
                 findPagebreaksTool,
@@ -336,6 +681,27 @@ struct LatexMCP {
         // 處理 tool 呼叫
         await server.withMethodHandler(CallTool.self) { params in
             switch params.name {
+            case "compile_latex":
+                let projectPath = params.arguments?["project_path"]?.stringValue ?? ""
+                let mainFile = params.arguments?["main_file"]?.stringValue ?? "main"
+                let engine = params.arguments?["engine"]?.stringValue ?? "xelatex"
+                let fullCompile = Bool(params.arguments?["full_compile"] ?? .bool(true), strict: false) ?? true
+                let result = compileLatex(projectPath: projectPath, mainFile: mainFile, engine: engine, fullCompile: fullCompile)
+                return .init(content: [.text(result)], isError: false)
+
+            case "check_errors":
+                let projectPath = params.arguments?["project_path"]?.stringValue ?? ""
+                let mainFile = params.arguments?["main_file"]?.stringValue ?? "main"
+                let includeWarnings = Bool(params.arguments?["include_warnings"] ?? .bool(false), strict: false) ?? false
+                let result = checkErrors(projectPath: projectPath, mainFile: mainFile, includeWarnings: includeWarnings)
+                return .init(content: [.text(result)], isError: false)
+
+            case "get_document_info":
+                let projectPath = params.arguments?["project_path"]?.stringValue ?? ""
+                let mainFile = params.arguments?["main_file"]?.stringValue ?? "main"
+                let result = getDocumentInfo(projectPath: projectPath, mainFile: mainFile)
+                return .init(content: [.text(result)], isError: false)
+
             case "analyze_pages":
                 let projectPath = params.arguments?["project_path"]?.stringValue ?? ""
                 let mainFile = params.arguments?["main_file"]?.stringValue ?? "main"
